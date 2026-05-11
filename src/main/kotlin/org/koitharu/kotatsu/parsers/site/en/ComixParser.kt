@@ -315,7 +315,9 @@ internal class Comix(context: MangaLoaderContext) :
     private fun apiUrl(path: String): String = "https://$domain/api/v1/${path.removePrefix("/")}"
 
     private suspend fun webViewApiJson(apiPath: String): JSONObject {
-        return evaluateWebViewJson(buildWebViewApiScript("return await fetchProtected(${apiPath.toJsString()});"))
+        return evaluateWebViewJson(
+            buildWebViewApiScript("return JSON.stringify(await fetchProtected(${apiPath.toJsString()}));"),
+        )
     }
 
     private suspend fun webViewChapterList(hashId: String): JSONArray {
@@ -329,6 +331,10 @@ internal class Comix(context: MangaLoaderContext) :
                         const root = await fetchProtected(${pathPrefix.toJsString()} + page);
                         const result = root && root.result ? root.result : root;
                         const items = result && Array.isArray(result.items) ? result.items : [];
+                        if (page === 1 && !items.length) {
+                            const keys = result && typeof result === "object" ? Object.keys(result).join(",") : typeof result;
+                            throw new Error("chapter payload has no items; keys=" + keys);
+                        }
                         for (const item of items) all.push(item);
                         const pagination = (result && (result.pagination || result.meta)) || {};
                         const currentPage = Number(pagination.page || pagination.current_page || page);
