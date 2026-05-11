@@ -318,7 +318,7 @@ internal class Comix(context: MangaLoaderContext) :
         logDebug("webViewApiJson start path=$apiPath")
         return evaluateWebViewJson(
             label = apiPath,
-            script = buildWebViewApiScript("return JSON.stringify(await fetchProtected(${apiPath.toJsString()}));"),
+            script = buildWebViewApiScript("return JSON.stringify(fetchProtected(${apiPath.toJsString()}));"),
         )
     }
 
@@ -332,7 +332,7 @@ internal class Comix(context: MangaLoaderContext) :
                     const all = [];
                     let page = 1;
                     while (page <= $MAX_CHAPTER_API_PAGES) {
-                        const root = await fetchProtected(${pathPrefix.toJsString()} + page);
+                        const root = fetchProtected(${pathPrefix.toJsString()} + page);
                         const result = root && root.result ? root.result : root;
                         const items = result && Array.isArray(result.items) ? result.items : [];
                         if (page === 1 && !items.length) {
@@ -392,10 +392,9 @@ internal class Comix(context: MangaLoaderContext) :
 
     private fun buildWebViewApiScript(body: String): String {
         return """
-            (async function() {
+            (() => {
                 const probePath = "/manga/g2rk/chapters";
                 const tokenRegex = /^[A-Za-z0-9_-]{40,200}$/;
-                const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
                 const challengeDetected = () => {
                     const root = document.documentElement;
                     const html = (root && root.outerHTML) || "";
@@ -456,13 +455,8 @@ internal class Comix(context: MangaLoaderContext) :
                 };
 
                 try {
-                    let glue = null;
-                    for (let attempt = 0; attempt < 80; attempt++) {
-                        if (challengeDetected()) return "$CLOUDFLARE_BLOCKED";
-                        glue = findGlue();
-                        if (glue) break;
-                        await sleep(250);
-                    }
+                    if (challengeDetected()) return "$CLOUDFLARE_BLOCKED";
+                    const glue = findGlue();
                     if (!glue) throw new Error("signer/decryptor not detected");
 
                     const captured = { res: null };
@@ -475,31 +469,36 @@ internal class Comix(context: MangaLoaderContext) :
                     };
                     glue.installer(fakeAxios);
 
-                    const fetchProtected = async (apiPath) => {
+                    const fetchProtected = (apiPath) => {
                         const signablePath = apiPath.split("?")[0].replace(/^\/api\/v1/, "");
                         const sig = glue.signer(signablePath);
                         if (!sig) throw new Error("signer returned empty token");
                         const sep = apiPath.indexOf("?") === -1 ? "?" : "&";
                         const url = apiPath + sep + "_=" + encodeURIComponent(sig);
-                        const resp = await fetch(url, {
-                            credentials: "include",
-                            headers: { "Accept": "application/json", "X-Requested-With": "XMLHttpRequest" }
-                        });
-                        const text = await resp.text();
-                        if (resp.status < 200 || resp.status >= 300) {
-                            throw new Error("HTTP " + resp.status + ": " + text.slice(0, 200));
+                        const xhr = new XMLHttpRequest();
+                        xhr.open("GET", url, false);
+                        xhr.withCredentials = true;
+                        xhr.setRequestHeader("Accept", "application/json");
+                        xhr.setRequestHeader("X-Requested-With", "XMLHttpRequest");
+                        xhr.send(null);
+                        const text = xhr.responseText || "";
+                        if (xhr.status < 200 || xhr.status >= 300) {
+                            throw new Error("HTTP " + xhr.status + ": " + text.slice(0, 200));
                         }
                         const raw = JSON.parse(text);
                         if (raw && typeof raw === "object" && "e" in raw && captured.res) {
                             const fakeResp = {
                                 data: raw,
-                                status: resp.status,
-                                statusText: resp.statusText,
-                                headers: Object.fromEntries([...resp.headers.entries()]),
+                                status: xhr.status,
+                                statusText: xhr.statusText,
+                                headers: {},
                                 config: { url: url, method: "get", baseURL: "/api/v1" },
                                 request: {}
                             };
-                            const decoded = await captured.res(fakeResp);
+                            const decoded = captured.res(fakeResp);
+                            if (decoded && typeof decoded.then === "function") {
+                                throw new Error("decryptor returned promise; async evaluateJs is unsupported");
+                            }
                             return { result: decoded && decoded.data };
                         }
                         if (raw && typeof raw === "object" && "result" in raw) return raw;
