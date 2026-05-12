@@ -543,7 +543,7 @@ internal class Comix(context: MangaLoaderContext) :
                     }
 
                     const fetchProtected = async (apiPath) => {
-                        const signablePath = apiPath.split("?")[0].replace(/^\/api\/v1/, "");
+                        const signablePath = apiPath.replace(/^\/api\/v1/, "");
                         const sig = glue.signer(signablePath);
                         if (!sig) throw new Error("signer returned empty token");
                         const sep = apiPath.indexOf("?") === -1 ? "?" : "&";
