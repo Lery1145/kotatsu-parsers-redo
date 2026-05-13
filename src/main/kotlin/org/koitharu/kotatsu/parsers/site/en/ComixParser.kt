@@ -363,10 +363,13 @@ internal class Comix(context: MangaLoaderContext) :
 
                     const firstRoot = await fetchProtected(pagePath(1, ""));
                     const firstResult = firstRoot && firstRoot.result ? firstRoot.result : firstRoot;
-                    const firstItems = firstResult && Array.isArray(firstResult.items) ? firstResult.items : [];
-                    if (!firstItems.length) {
+                    if (!firstResult || !Array.isArray(firstResult.items)) {
                         const keys = firstResult && typeof firstResult === "object" ? Object.keys(firstResult).join(",") : typeof firstResult;
                         throw new Error("chapter payload has no items; keys=" + keys);
+                    }
+                    const firstItems = firstResult.items;
+                    if (!firstItems.length) {
+                        return JSON.stringify({ items: [], debug: { pages: 1, count: 0, groupId: "", firstPageCount: 0 } });
                     }
 
                     const groupId = mostActiveGroupId(firstItems);
@@ -379,11 +382,11 @@ internal class Comix(context: MangaLoaderContext) :
                     while (page <= $MAX_CHAPTER_API_PAGES) {
                         const root = await fetchProtected(pagePath(page, groupId));
                         const result = root && root.result ? root.result : root;
-                        const items = result && Array.isArray(result.items) ? result.items : [];
-                        if (!items.length && page === 1) {
+                        if (!result || !Array.isArray(result.items)) {
                             const keys = result && typeof result === "object" ? Object.keys(result).join(",") : typeof result;
                             throw new Error("chapter payload has no items; keys=" + keys);
                         }
+                        const items = result.items;
                         appendItems(items);
                         const pagination = pageInfo(result, page);
                         if (!items.length || pagination.current >= pagination.last) break;
