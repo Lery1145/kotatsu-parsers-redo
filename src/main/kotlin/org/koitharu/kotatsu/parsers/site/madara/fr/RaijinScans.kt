@@ -279,24 +279,34 @@ internal class RaijinScans(context: MangaLoaderContext) :
 	}
 
 	private fun decodeRjAjaxConfig(doc: Document): RjAjaxConfig? {
-		val script = doc.select("script:containsData(RJ map sync)")
-			.firstOrNull()
-			?.data()
+		// The reader config is delivered inline as window["rjfr_<hash>"].push({"m":..,"c":..}).
+		// "m" is a pipe-separated list of token ids giving the order in which the base64
+		// fragments in the "c" map must be concatenated; the result decodes to a JSON object
+		// {"m":[..],"d":[..],"l":[..]} where "d" holds the scrambled config and "m"/"l" are
+		// two permutations that must both be applied to recover the real field order.
+		val payloadJson = doc.select("script")
+			.firstNotNullOfOrNull { script -> RJ_PAYLOAD_REGEX.find(script.data())?.value }
 			?: return null
-		val chunks = RJ_CHUNK_REGEX.findAll(script)
-			.map { match ->
-				match.groupValues[1].toInt(36) to decodeBase64Chunk(match.groupValues[2])
-			}
-			.sortedBy { it.first }
-			.joinToString(separator = "") { it.second }
-		if (chunks.isBlank()) return null
+		val payload = JSONObject(payloadJson)
+		val fragments = payload.getJSONObject("c")
+		val base64 = buildString {
+			payload.getString("m").split('|').forEach { token -> append(fragments.optString(token)) }
+		}
+		if (base64.isBlank()) return null
 
-		val root = JSONArray(chunks)
-		val order = root.getJSONArray(0)
-		val scrambled = root.getJSONArray(1)
-		val values = arrayOfNulls<Any>(order.length())
-		for (i in 0 until order.length()) {
-			values[order.getInt(i)] = scrambled.get(i)
+		val inner = JSONObject(decodeBase64Chunk(base64))
+		val firstOrder = inner.getJSONArray("m")
+		val scrambled = inner.getJSONArray("d")
+		val secondOrder = inner.getJSONArray("l")
+		// First pass: place each scrambled value at its index in "m".
+		val intermediate = arrayOfNulls<Any>(firstOrder.length())
+		for (i in 0 until firstOrder.length()) {
+			intermediate[firstOrder.getInt(i)] = scrambled.get(i)
+		}
+		// Second pass: gather through "l" to get the final, fixed field layout.
+		val values = arrayOfNulls<Any>(secondOrder.length())
+		for (j in 0 until secondOrder.length()) {
+			values[j] = intermediate[secondOrder.getInt(j)]
 		}
 
 		val fieldNames = values[13] as? JSONArray ?: return null
@@ -397,6 +407,6 @@ internal class RaijinScans(context: MangaLoaderContext) :
 	)
 
 	private companion object {
-		private val RJ_CHUNK_REGEX = Regex(""""([0-9a-z]+)\.([A-Za-z0-9+/=_-]+)"""")
+		private val RJ_PAYLOAD_REGEX = Regex("""\{"m":"[^"]*","c":\{[^}]*}}""")
 	}
 }

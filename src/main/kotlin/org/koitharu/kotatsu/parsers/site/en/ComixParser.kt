@@ -3,10 +3,14 @@ package org.koitharu.kotatsu.parsers.site.en
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import okhttp3.Headers
+import okhttp3.Interceptor
+import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
+import org.koitharu.kotatsu.parsers.bitmap.Bitmap
+import org.koitharu.kotatsu.parsers.bitmap.Rect
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.exception.ParseException
@@ -16,6 +20,7 @@ import org.koitharu.kotatsu.parsers.webview.InterceptionConfig
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
 
 @MangaSourceParser("COMIX", "Comix", "en", ContentType.MANGA)
 internal class Comix(context: MangaLoaderContext) :
@@ -51,17 +56,27 @@ internal class Comix(context: MangaLoaderContext) :
         availableTags = fetchAvailableTags(),
     )
 
+    // The site's curated genres, keyed by the numeric id the API expects in
+    // `genres_in[]` (verified against /api/v1/tags/search?type=genre). The
+    // narrative "tags" (Demons, School Life, ...) live in a separate id space
+    // with thousands of entries and no listing endpoint, so they aren't
+    // enumerated here — they still work via search because every tag shown on
+    // a manga's detail page carries its own numeric id (see [parseTerms]),
+    // and any non-numeric tag key is resolved by name through [resolveTagId].
     private suspend fun fetchAvailableTags(): Set<MangaTag> {
         return setOf(
-            // Genres
             MangaTag(key = "6", title = "Action", source = source),
+            MangaTag(key = "87264", title = "Adult", source = source),
             MangaTag(key = "7", title = "Adventure", source = source),
             MangaTag(key = "8", title = "Boys Love", source = source),
             MangaTag(key = "9", title = "Comedy", source = source),
             MangaTag(key = "10", title = "Crime", source = source),
             MangaTag(key = "11", title = "Drama", source = source),
+            MangaTag(key = "87265", title = "Ecchi", source = source),
             MangaTag(key = "12", title = "Fantasy", source = source),
             MangaTag(key = "13", title = "Girls Love", source = source),
+            MangaTag(key = "40", title = "Harem", source = source),
+            MangaTag(key = "87266", title = "Hentai", source = source),
             MangaTag(key = "14", title = "Historical", source = source),
             MangaTag(key = "15", title = "Horror", source = source),
             MangaTag(key = "16", title = "Isekai", source = source),
@@ -75,49 +90,12 @@ internal class Comix(context: MangaLoaderContext) :
             MangaTag(key = "23", title = "Romance", source = source),
             MangaTag(key = "24", title = "Sci-Fi", source = source),
             MangaTag(key = "25", title = "Slice of Life", source = source),
+            MangaTag(key = "87268", title = "Smut", source = source),
             MangaTag(key = "26", title = "Sports", source = source),
             MangaTag(key = "27", title = "Superhero", source = source),
             MangaTag(key = "28", title = "Thriller", source = source),
             MangaTag(key = "29", title = "Tragedy", source = source),
             MangaTag(key = "30", title = "Wuxia", source = source),
-            // Themes
-            MangaTag(key = "31", title = "Aliens", source = source),
-            MangaTag(key = "32", title = "Animals", source = source),
-            MangaTag(key = "33", title = "Cooking", source = source),
-            MangaTag(key = "34", title = "Crossdressing", source = source),
-            MangaTag(key = "35", title = "Delinquents", source = source),
-            MangaTag(key = "36", title = "Demons", source = source),
-            MangaTag(key = "37", title = "Genderswap", source = source),
-            MangaTag(key = "38", title = "Ghosts", source = source),
-            MangaTag(key = "39", title = "Gyaru", source = source),
-            MangaTag(key = "40", title = "Harem", source = source),
-            MangaTag(key = "41", title = "Incest", source = source),
-            MangaTag(key = "42", title = "Loli", source = source),
-            MangaTag(key = "43", title = "Mafia", source = source),
-            MangaTag(key = "44", title = "Magic", source = source),
-            MangaTag(key = "45", title = "Martial Arts", source = source),
-            MangaTag(key = "46", title = "Military", source = source),
-            MangaTag(key = "47", title = "Monster Girls", source = source),
-            MangaTag(key = "48", title = "Monsters", source = source),
-            MangaTag(key = "49", title = "Music", source = source),
-            MangaTag(key = "50", title = "Ninja", source = source),
-            MangaTag(key = "51", title = "Office Workers", source = source),
-            MangaTag(key = "52", title = "Police", source = source),
-            MangaTag(key = "53", title = "Post-Apocalyptic", source = source),
-            MangaTag(key = "54", title = "Reincarnation", source = source),
-            MangaTag(key = "55", title = "Reverse Harem", source = source),
-            MangaTag(key = "56", title = "Samurai", source = source),
-            MangaTag(key = "57", title = "School Life", source = source),
-            MangaTag(key = "58", title = "Shota", source = source),
-            MangaTag(key = "59", title = "Supernatural", source = source),
-            MangaTag(key = "60", title = "Survival", source = source),
-            MangaTag(key = "61", title = "Time Travel", source = source),
-            MangaTag(key = "62", title = "Traditional Games", source = source),
-            MangaTag(key = "63", title = "Vampires", source = source),
-            MangaTag(key = "64", title = "Video Games", source = source),
-            MangaTag(key = "65", title = "Villainess", source = source),
-            MangaTag(key = "66", title = "Virtual Reality", source = source),
-            MangaTag(key = "67", title = "Zombies", source = source),
         )
     }
 
@@ -150,18 +128,25 @@ internal class Comix(context: MangaLoaderContext) :
                 else -> addParam("order[chapter_updated_at]=desc")
             }
 
-            // Handle genre filtering
-            if (filter.tags.isNotEmpty()) {
-                for (tag in filter.tags) {
-                    addParam("genres_in[]=${tag.key}")
-                }
+            // Handle genre/tag filtering. A tag key is normally the numeric id
+            // the API wants; anything non-numeric (e.g. a tag tapped from a
+            // manga's detail page that predates this change) is resolved by name.
+            val includedIds = LinkedHashSet<String>()
+            for (tag in filter.tags) {
+                val id = tag.key.toIntOrNull()?.let { tag.key } ?: resolveTagId(tag.title)
+                if (id != null) includedIds.add(id)
+            }
+            for (id in includedIds) {
+                addParam("genres_in[]=$id")
             }
 
-            // Default exclude adult content
-            addParam("genres_ex[]=87264") // Adult
-            addParam("genres_ex[]=87266") // Hentai
-            addParam("genres_ex[]=87268") // Smut
-            addParam("genres_ex[]=87265") // Ecchi
+            // Default exclude adult content, unless the user explicitly asked
+            // for one of those genres via the filter.
+            for (excludeId in ADULT_EXCLUDE_IDS) {
+                if (excludeId !in includedIds) {
+                    addParam("genres_ex[]=$excludeId")
+                }
+            }
             addParam("limit=$pageSize")
             addParam("page=$page")
         }
@@ -248,22 +233,82 @@ internal class Comix(context: MangaLoaderContext) :
             ?: JSONArray()
 
         return (0 until pages.length()).map { i ->
-            val rawUrl = when (val item = pages.get(i)) {
-                is JSONObject -> item.getString("url")
-                else -> item.toString()
-            }
+            val item = pages.optJSONObject(i)
+            val rawUrl = item?.getString("url") ?: pages.get(i).toString()
             val imageUrl = if (rawUrl.startsWith("http", ignoreCase = true) || baseUrl.isBlank()) {
                 rawUrl
             } else {
                 "$baseUrl/${rawUrl.trimStart('/')}"
             }
+            // `s == 1` marks a tile-scrambled image. The interceptor descrambles
+            // based on the response header, but tagging the URL keeps scrambled
+            // pages from colliding with any unscrambled namesake in the cache.
+            val finalUrl = if (item?.optInt("s", 0) == 1) "$imageUrl#$SCRAMBLED_FRAGMENT" else imageUrl
             MangaPage(
                 id = generateUid("$chapterId-$i"),
-                url = imageUrl,
+                url = finalUrl,
                 preview = null,
                 source = source,
             )
         }
+    }
+
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val response = chain.proceed(chain.request())
+        if (!response.isSuccessful) {
+            return response
+        }
+        // The image CDN signals a tile-scrambled image with this header; it's
+        // the authoritative trigger (only scrambled images carry it, so API and
+        // HTML responses pass straight through). A zero seed means "not scrambled".
+        val seed = response.header("x-scramble-seed")?.toLongOrNull()?.toInt()
+        if (seed == null || seed == 0) {
+            return response
+        }
+        return context.redrawImageResponse(response) { bitmap ->
+            descramble(bitmap, seed)
+        }
+    }
+
+    // Reverses the site's 5x5 tile shuffle. The scramble order is a Fisher-Yates
+    // permutation driven by an LCG seeded with the `x-scramble-seed` header, so
+    // tile `i` of the scrambled image belongs at position `order[i]`.
+    private fun descramble(source: Bitmap, seed: Int): Bitmap {
+        val width = source.width
+        val height = source.height
+        val tileW = width / GRID_COLS
+        val tileH = height / GRID_ROWS
+        val order = buildScrambleOrder(seed, NUM_TILES)
+
+        val output = context.createBitmap(width, height)
+        // Copy the whole image first so any edge pixels left over from the
+        // integer tile division are preserved.
+        output.drawBitmap(source, Rect(0, 0, width, height), Rect(0, 0, width, height))
+
+        for (srcIdx in 0 until NUM_TILES) {
+            val dstIdx = order[srcIdx]
+            val srcCol = srcIdx % GRID_COLS
+            val srcRow = srcIdx / GRID_COLS
+            val dstCol = dstIdx % GRID_COLS
+            val dstRow = dstIdx / GRID_COLS
+            val srcRect = Rect(srcCol * tileW, srcRow * tileH, (srcCol + 1) * tileW, (srcRow + 1) * tileH)
+            val dstRect = Rect(dstCol * tileW, dstRow * tileH, (dstCol + 1) * tileW, (dstRow + 1) * tileH)
+            output.drawBitmap(source, srcRect, dstRect)
+        }
+        return output
+    }
+
+    private fun buildScrambleOrder(seed: Int, n: Int): IntArray {
+        val arr = IntArray(n) { it }
+        var state = seed
+        for (i in n - 1 downTo 1) {
+            state = state * LCG_MULTIPLIER + LCG_INCREMENT
+            val j = ((state.toLong() and 0xFFFFFFFFL) % (i + 1)).toInt()
+            val tmp = arr[i]
+            arr[i] = arr[j]
+            arr[j] = tmp
+        }
+        return arr
     }
 
     private suspend fun getChapters(manga: Manga): List<MangaChapter> {
@@ -682,12 +727,43 @@ internal class Comix(context: MangaLoaderContext) :
             val title = item.optString("title").nullIfEmpty()
                 ?: item.optString("name").nullIfEmpty()
                 ?: return@mapNotNullTo null
+            // Prefer the numeric id — it's exactly what `genres_in[]` expects,
+            // so a tag chip tapped on the details page filters correctly with
+            // no name lookup. Fall back to the title for safety.
+            val key = item.optIntOrNull("id")?.toString() ?: title
             MangaTag(
-                key = title,
+                key = key,
                 title = title,
                 source = source,
             )
         }
+    }
+
+    private val tagIdCache = ConcurrentHashMap<String, String>()
+
+    /**
+     * Resolve a genre/tag name to the numeric id the API uses in `genres_in[]`,
+     * via the public /tags/search endpoint. Curated genres are looked up first
+     * (`type=genre`), then the larger narrative-tag space (`type=tag`). Results
+     * are cached; an empty string marks a name that matched nothing.
+     */
+    private suspend fun resolveTagId(name: String): String? {
+        val cacheKey = name.trim().lowercase(Locale.US)
+        if (cacheKey.isEmpty()) return null
+        tagIdCache[cacheKey]?.let { return it.nullIfEmpty() }
+        for (type in arrayOf("genre", "tag")) {
+            val url = apiUrl("tags/search?type=$type&q=${name.urlEncoded()}")
+            val result = runCatching {
+                webClient.httpGet(url).parseJson().optJSONArray("result")
+            }.getOrNull()
+            val id = result?.optJSONObject(0)?.optIntOrNull("id")?.toString()
+            if (id != null) {
+                tagIdCache[cacheKey] = id
+                return id
+            }
+        }
+        tagIdCache[cacheKey] = ""
+        return null
     }
 
     private fun parseAuthors(json: JSONObject): Set<String> {
@@ -730,6 +806,13 @@ internal class Comix(context: MangaLoaderContext) :
     private companion object {
         private val NSFW_RATINGS = setOf("erotica", "pornographic")
         private val TERM_KEYS = arrayOf("genres", "genre", "tags", "theme", "demographics", "demographic", "formats")
+        private val ADULT_EXCLUDE_IDS = listOf("87264", "87266", "87268", "87265") // Adult, Hentai, Smut, Ecchi
+        private const val SCRAMBLED_FRAGMENT = "scrambled"
+        private const val GRID_COLS = 5
+        private const val GRID_ROWS = 5
+        private const val NUM_TILES = GRID_COLS * GRID_ROWS
+        private const val LCG_MULTIPLIER = 1664525
+        private const val LCG_INCREMENT = 1013904223
         private val RELATIVE_DATE_REGEX = Regex("""^(\d+)\s*(s|m|h|d|w|mo|mos|y|yr|yrs|min|mins|sec|secs|hr|hrs|day|days|week|weeks|month|months|year|years)$""")
         private val UNICODE_ESCAPE_REGEX = Regex("""\\u([0-9A-Fa-f]{4})""")
         private const val WEBVIEW_API_TIMEOUT = 90000L
