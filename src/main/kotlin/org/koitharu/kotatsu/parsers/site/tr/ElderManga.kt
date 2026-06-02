@@ -2,6 +2,7 @@ package org.koitharu.kotatsu.parsers.site.tr
 
 import org.json.JSONArray
 import org.jsoup.nodes.Document
+import org.koitharu.kotatsu.parsers.Broken
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
@@ -12,6 +13,7 @@ import org.koitharu.kotatsu.parsers.util.json.*
 import java.text.SimpleDateFormat
 import java.util.*
 
+@Broken
 @MangaSourceParser("ELDERMANGA", "Elder Manga", "tr")
 internal class ElderManga(context: MangaLoaderContext):
     PagedMangaParser(context, MangaParserSource.ELDERMANGA, 25) {
