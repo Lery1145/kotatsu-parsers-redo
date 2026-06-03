@@ -829,8 +829,9 @@ internal class Comix(context: MangaLoaderContext) :
         private const val CLOUDFLARE_MESSAGE =
             "Cloudflare verification is required. Open Comix in the in-app browser, complete the check, then try again."
 
-        // Hook for the manga page: bump the chapters page size to 100, pick one
-        // scanlation group from the first payload, and return only that group.
+        // Hook for the manga page: bump the chapters page size to 100 and collect
+        // every loaded chapter item. Kotlin assigns each scanlation group to a
+        // separate branch so alternate teams stay available.
         private val CHAPTERS_HOOK_SCRIPT = """
             new Promise(function (resolve) {
                 const rewriteUrl = function (url) {
@@ -847,42 +848,11 @@ internal class Comix(context: MangaLoaderContext) :
                 const originalParse = JSON.parse;
                 const seen = new Set();
                 const items = [];
-                let selectedTeamKey = null;
                 let submitted = false;
-                const teamKeyOf = function (item) {
-                    const group = item && (item.group || item.scanlation_group);
-                    if (group && group.id !== undefined && group.id !== null) {
-                        return 'group:' + String(group.id);
-                    }
-                    if (item && item.isOfficial) {
-                        return 'official';
-                    }
-                    return '';
-                };
-                const mostActiveTeamKey = function (list) {
-                    const counts = new Map();
-                    for (const item of list) {
-                        const key = teamKeyOf(item);
-                        if (!key) continue;
-                        counts.set(key, (counts.get(key) || 0) + 1);
-                    }
-                    let best = '';
-                    let bestCount = 0;
-                    for (const [key, count] of counts) {
-                        if (count > bestCount) {
-                            best = key;
-                            bestCount = count;
-                        }
-                    }
-                    return best;
-                };
                 const submit = function () {
                     if (submitted) return;
                     submitted = true;
-                    const selected = selectedTeamKey ? items.filter(function (item) {
-                        return teamKeyOf(item) === selectedTeamKey;
-                    }) : items;
-                    resolve(JSON.stringify({ items: selected }));
+                    resolve(JSON.stringify({ items: items }));
                 };
                 JSON.parse = new Proxy(originalParse, {
                     apply(target, thisArg, args) {
@@ -898,9 +868,6 @@ internal class Comix(context: MangaLoaderContext) :
                                 const page = (meta && meta.page) || 1;
                                 if (!seen.has(page)) {
                                     seen.add(page);
-                                    if (selectedTeamKey === null) {
-                                        selectedTeamKey = mostActiveTeamKey(parsed.result.items);
-                                    }
                                     for (const it of parsed.result.items) items.push(it);
                                     if (meta && meta.hasNext) {
                                         let tries = 0;
