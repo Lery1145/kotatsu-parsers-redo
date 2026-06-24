@@ -296,7 +296,14 @@ internal class Comix(context: MangaLoaderContext) :
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val chapterId = chapter.url.substringAfterLast("/").substringBefore("-")
-        val response = webViewApiJson("/api/v1/chapters/$chapterId")
+        val readerUrl = chapter.url.toAbsoluteUrl(domain)
+
+        // Capture the reader page's own (signed, decrypted) page payload rather
+        // than re-implementing the request signing, which hangs (see [loadAllChapters]).
+        val response = runCatching { webClient.httpGet(readerUrl).parseHtml() }
+            .getOrNull()
+            ?.let { extractInitialDataPages(it) }
+            ?: evaluateWebViewApiJson(readerUrl, PAGE_CAPTURE_SCRIPT)
         val pagesRoot = response.optJSONObject("result")?.optJSONObject("pages")
         val baseUrl = pagesRoot?.optString("baseUrl").orEmpty().trimEnd('/')
         val pages = pagesRoot?.optJSONArray("items")
@@ -548,69 +555,54 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     private suspend fun loadAllChapters(hashId: String): JSONArray {
-        val apiPath = "/api/v1/manga/$hashId/chapters"
-        // Run the signer-driven pagination on the stable `/browse` route — the
-        // home/title pages error on a "protected fetch 404" and reload-loop,
-        // de-injecting our script before it can finish (see [signerHostUrl]).
-        val response = evaluateWebViewApiJson(
-            pageUrl = signerHostUrl(),
-            script = buildWebViewApiScript(
-                """
-                    const basePath = ${apiPath.toJsString()};
-                    const limit = 100;
-                    const unwrap = (payload) => (payload && payload.result ? payload.result : payload) || {};
-                    const itemsOf = (result) => Array.isArray(result && result.items) ? result.items : [];
+        val titleUrl = "https://$domain/title/$hashId"
 
-                    // Fetch the first page to learn the total, then pull the rest in
-                    // parallel. A slow page-by-page loop gets killed when the host
-                    // page reloads mid-flight, so we finish in just two round-trips.
-                    const firstResult = unwrap(await fetchProtected(basePath + "?limit=" + limit + "&page=1"));
-                    const items = itemsOf(firstResult).slice();
-                    const meta = (firstResult.meta || firstResult.pagination) || {};
-                    let lastPage = Number(
-                        meta.lastPage || meta.last_page || meta.totalPages ||
-                        meta.total_pages || meta.pageCount || meta.pages || 1
-                    ) || 1;
-                    if (lastPage > 200) lastPage = 200;
+        // Fast path: the title page may inline the first chapters page in its
+        // server-rendered `script#initial-data`.
+        runCatching { webClient.httpGet(titleUrl).parseHtml() }
+            .getOrNull()
+            ?.let { extractInitialDataChapters(it) }
+            ?.let { return it }
 
-                    if (lastPage > 1) {
-                        const requests = [];
-                        for (let page = 2; page <= lastPage; page++) {
-                            // Tolerate a failed page: return its items or [] so one
-                            // bad request never rejects the whole batch.
-                            requests.push(
-                                fetchProtected(basePath + "?limit=" + limit + "&page=" + page)
-                                    .then((payload) => itemsOf(unwrap(payload)))
-                                    .catch(() => [])
-                            );
-                        }
-                        const lists = await Promise.all(requests);
-                        for (const list of lists) {
-                            for (const item of list) items.push(item);
-                        }
-                    }
-                    return JSON.stringify({ items: items });
-                """.trimIndent(),
-            ),
-        )
+        // Otherwise let the title page fetch (and decrypt) its own chapter list
+        // and capture what it parses. We deliberately don't re-implement the
+        // site's request signing (the findGlue/fetchProtected path hangs against
+        // the current bundle); capturing the page's own request is what works,
+        // exactly like the browse listing.
+        val response = evaluateWebViewApiJson(titleUrl, CHAPTER_CAPTURE_SCRIPT)
         return response.optJSONArray("items") ?: JSONArray()
     }
 
-    private fun apiUrl(path: String): String = "https://$domain/api/v1/${path.removePrefix("/")}"
-
-    // The signer glue is global, so we host it on the `/browse` route. The home
-    // page (and the cache-buster URL we used before) isn't a real SPA route — its
-    // `secure-*.js` throws "protected fetch 404" and the app reload-loops, which
-    // de-injects our script before it can run. `/browse` loads cleanly and stays
-    // put, so the signer-driven fetches actually complete.
-    private fun signerHostUrl(): String = "https://$domain/browse?kotatsu=${System.currentTimeMillis()}"
-
-    private suspend fun webViewApiJson(apiPath: String): JSONObject {
-        return evaluateWebViewApiJson(
-            pageUrl = signerHostUrl(),
-            script = buildWebViewApiScript("return JSON.stringify(await fetchProtected(${apiPath.toJsString()}));"),
-        )
+    private fun extractInitialDataChapters(document: Document): JSONArray? {
+        val raw = document.selectFirst("script#initial-data")?.data()?.nullIfEmpty() ?: return null
+        val queries = runCatching { JSONObject(raw).optJSONObject("queries") }.getOrNull() ?: return null
+        for (key in queries.keys()) {
+            val value = queries.optJSONObject(key) ?: continue
+            val items = value.optJSONObject("result")?.optJSONArray("items")
+                ?: value.optJSONArray("items")
+                ?: continue
+            // Chapters carry a numeric `number`; manga listings don't — use that
+            // to avoid grabbing a co-located manga-list query.
+            val first = items.optJSONObject(0) ?: continue
+            if (items.length() > 0 && first.has("number") && first.has("id")) {
+                return items
+            }
+        }
+        return null
     }
+
+    private fun extractInitialDataPages(document: Document): JSONObject? {
+        val raw = document.selectFirst("script#initial-data")?.data()?.nullIfEmpty() ?: return null
+        val queries = runCatching { JSONObject(raw).optJSONObject("queries") }.getOrNull() ?: return null
+        for (key in queries.keys()) {
+            val value = queries.optJSONObject(key) ?: continue
+            if (value.optJSONObject("result")?.has("pages") == true) return value
+            if (value.has("pages")) return JSONObject().put("result", value)
+        }
+        return null
+    }
+
+    private fun apiUrl(path: String): String = "https://$domain/api/v1/${path.removePrefix("/")}"
 
     private suspend fun evaluateWebViewApiJson(pageUrl: String, script: String): JSONObject {
         val bridgeScript = buildWebViewApiBridgeScript(script)
@@ -660,164 +652,6 @@ internal class Comix(context: MangaLoaderContext) :
                     window.location.href = "$INTERCEPT_RESULT_URL#data=" + encodeURIComponent(String(result || ""));
                 } catch (e) {
                     window.location.href = "$INTERCEPT_ERROR_URL#msg=" + encodeURIComponent(String((e && e.message) || e));
-                }
-            })();
-        """.trimIndent()
-    }
-
-    private fun buildWebViewApiScript(body: String): String {
-        return """
-            (async () => {
-                const probePath = "/manga/g2rk/chapters";
-                const tokenRegex = /^[A-Za-z0-9_-]{20,200}$/;
-                const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-                const challengeDetected = () => {
-                    const root = document.documentElement;
-                    const html = (root && root.outerHTML) || "";
-                    const text = ((document.body && document.body.innerText) || (root && root.innerText) || "");
-                    const lower = (document.title + "\n" + text + "\n" + html).toLowerCase();
-                    return document.querySelector('script[src*="challenge-platform"]') !== null ||
-                        document.querySelector('script[src*="turnstile"]') !== null ||
-                        document.querySelector('iframe[src*="challenges.cloudflare.com"]') !== null ||
-                        document.querySelector('.cf-turnstile') !== null ||
-                        document.querySelector('form[action*="__cf_chl"]') !== null ||
-                        document.querySelector('.cf-browser-verification') !== null ||
-                        ((lower.includes('just a moment') || lower.includes('checking your browser')) && lower.includes('cloudflare')) ||
-                        lower.includes('challenge-platform') ||
-                        lower.includes('challenges.cloudflare.com') ||
-                        lower.includes('cf-turnstile') ||
-                        lower.includes('turnstile') ||
-                        lower.includes('cf-chl-opt');
-                };
-                const findGlue = () => {
-                    let signer = null;
-                    let installer = null;
-                    let responseHandler = null;
-                    const keys = Object.keys(window);
-                    for (let i = 0; i < keys.length; i++) {
-                        const topName = keys[i];
-                        if (!/^vm[A-Za-z]_\w+${'$'}/.test(topName)) continue;
-                        const ns = window[topName];
-                        if (!ns || typeof ns !== "object") continue;
-                        const fnames = Object.keys(ns);
-                        for (let j = 0; j < fnames.length; j++) {
-                            const fn = ns[fnames[j]];
-                            if (typeof fn !== "function") continue;
-                            if (!signer) {
-                                try {
-                                    const out = fn(probePath);
-                                    if (typeof out === "string" && out !== probePath && tokenRegex.test(out)) {
-                                        signer = fn;
-                                    }
-                                } catch (e) {}
-                            }
-                            if (!installer) {
-                                try {
-                                    let got = false;
-                                    let resFn = null;
-                                    const fakeAxios = {
-                                        interceptors: {
-                                            request: { use: function() {} },
-                                            response: { use: function(fn) { got = true; resFn = fn; } }
-                                        },
-                                        defaults: { headers: { common: {} }, transformRequest: [], transformResponse: [] }
-                                    };
-                                    fn(fakeAxios);
-                                    if (got) {
-                                        installer = fn;
-                                        responseHandler = resFn;
-                                    }
-                                } catch (e) {}
-                            }
-                            if (signer && installer) return { signer, installer, responseHandler };
-                        }
-                    }
-                    return null;
-                };
-
-                try {
-                    let glue = null;
-                    for (let attempt = 0; attempt < 80; attempt++) {
-                        if (challengeDetected()) {
-                            return "$CLOUDFLARE_BLOCKED";
-                        }
-                        glue = findGlue();
-                        if (glue) break;
-                        await sleep(250);
-                    }
-                    if (!glue) throw new Error("signer/decryptor not detected");
-
-                    const captured = { res: glue.responseHandler || null };
-                    if (!captured.res) {
-                        const fakeAxios = {
-                            interceptors: {
-                                request: { use: function() {} },
-                                response: { use: function(fn) { captured.res = fn; } }
-                            },
-                            defaults: { headers: { common: {} }, transformRequest: [], transformResponse: [] }
-                        };
-                        glue.installer(fakeAxios);
-                    }
-
-                    const signCandidates = (apiPath) => {
-                        const withoutApi = apiPath.replace(/^\/api\/v1/, "");
-                        const withoutQuery = withoutApi.split("?")[0];
-                        const decoded = (() => {
-                            try { return decodeURIComponent(withoutApi); } catch (e) { return withoutApi; }
-                        })();
-                        return [...new Set([withoutApi, decoded, withoutQuery])];
-                    };
-
-                    const fetchProtected = async (apiPath) => {
-                        const sep = apiPath.indexOf("?") === -1 ? "?" : "&";
-                        let resp = null;
-                        let text = "";
-                        let signedUrl = "";
-                        let lastError = "";
-                        const candidates = signCandidates(apiPath);
-                        for (const signablePath of candidates) {
-                            const sig = glue.signer(signablePath);
-                            if (!sig) {
-                                lastError = "signer returned empty token";
-                                continue;
-                            }
-                            signedUrl = apiPath + sep + "_=" + encodeURIComponent(sig);
-                            resp = await fetch(signedUrl, {
-                                credentials: "include",
-                                headers: { "Accept": "application/json", "X-Requested-With": "XMLHttpRequest" }
-                            });
-                            text = await resp.text();
-                            if (resp.status >= 200 && resp.status < 300) break;
-                            lastError = "HTTP " + resp.status + " signed=" + signablePath + ": " + text.slice(0, 200);
-                            if (resp.status !== 422) break;
-                        }
-                        if (!resp) throw new Error(lastError || "request was not sent");
-                        if (resp.status < 200 || resp.status >= 300) {
-                            throw new Error(lastError || ("HTTP " + resp.status + ": " + text.slice(0, 200)));
-                        }
-                        const raw = JSON.parse(text);
-                        if (raw && typeof raw === "object" && "e" in raw && captured.res) {
-                            const fakeResp = {
-                                data: raw,
-                                status: resp.status,
-                                statusText: resp.statusText,
-                                headers: Object.fromEntries([...resp.headers.entries()]),
-                                config: { url: signedUrl, method: "get", baseURL: "/api/v1" },
-                                request: {}
-                            };
-                            const decoded = await captured.res(fakeResp);
-                            return { result: decoded && decoded.data };
-                        }
-                        if (raw && typeof raw === "object" && "e" in raw) {
-                            throw new Error("encrypted response received but decryptor was not captured");
-                        }
-                        if (raw && typeof raw === "object" && "result" in raw) return raw;
-                        return { result: raw };
-                    };
-
-                    $body
-                } catch (e) {
-                    return JSON.stringify({ error: String((e && e.message) || e) });
                 }
             })();
         """.trimIndent()
@@ -1041,6 +875,129 @@ internal class Comix(context: MangaLoaderContext) :
                     await sleep(150);
                 }
                 return JSON.stringify({ error: 'no browse data captured' });
+            })()
+        """
+
+        // Same capture technique as browse, but for the title page's chapter
+        // list. Chapters are recognised by a numeric `number` + `id` on the
+        // first item. Resolves with `{ items: [...] }`.
+        private const val CHAPTER_CAPTURE_SCRIPT = """
+            (async () => {
+                const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+                const original = JSON.parse;
+                let captured = null;
+                const take = (obj) => {
+                    if (captured) return true;
+                    try {
+                        const result = obj && obj.result ? obj.result : obj;
+                        const items = result && result.items;
+                        const first = Array.isArray(items) && items.length > 0 ? items[0] : null;
+                        if (first && first.id !== undefined && first.number !== undefined) {
+                            captured = JSON.stringify({ items: items });
+                            return true;
+                        }
+                    } catch (e) {}
+                    return false;
+                };
+                JSON.parse = function () {
+                    const parsed = original.apply(this, arguments);
+                    take(parsed);
+                    return parsed;
+                };
+                if (typeof window.fetch === 'function') {
+                    const originalFetch = window.fetch;
+                    window.fetch = function () {
+                        return originalFetch.apply(this, arguments).then((response) => {
+                            try {
+                                response.clone().text().then((text) => {
+                                    try { take(original(text)); } catch (e) {}
+                                }).catch(() => {});
+                            } catch (e) {}
+                            return response;
+                        });
+                    };
+                }
+                const originalSend = XMLHttpRequest.prototype.send;
+                XMLHttpRequest.prototype.send = function () {
+                    this.addEventListener('load', function () {
+                        try { take(original(this.responseText)); } catch (e) {}
+                    });
+                    return originalSend.apply(this, arguments);
+                };
+                for (let i = 0; i < 200; i++) {
+                    if (captured) return captured;
+                    try {
+                        const node = document.querySelector('script#initial-data');
+                        if (node && node.textContent) {
+                            const queries = original(node.textContent).queries;
+                            if (queries) {
+                                for (const k in queries) { if (take(queries[k])) break; }
+                            }
+                        }
+                    } catch (e) {}
+                    await sleep(150);
+                }
+                return JSON.stringify({ error: 'no chapter data captured' });
+            })()
+        """
+
+        // Same capture technique, for the reader page's page list, recognised by
+        // a `result.pages` object. Resolves with `{ result: { pages: ... } }`.
+        private const val PAGE_CAPTURE_SCRIPT = """
+            (async () => {
+                const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+                const original = JSON.parse;
+                let captured = null;
+                const take = (obj) => {
+                    if (captured) return true;
+                    try {
+                        const result = obj && obj.result ? obj.result : obj;
+                        if (result && result.pages) {
+                            captured = JSON.stringify({ result: result });
+                            return true;
+                        }
+                    } catch (e) {}
+                    return false;
+                };
+                JSON.parse = function () {
+                    const parsed = original.apply(this, arguments);
+                    take(parsed);
+                    return parsed;
+                };
+                if (typeof window.fetch === 'function') {
+                    const originalFetch = window.fetch;
+                    window.fetch = function () {
+                        return originalFetch.apply(this, arguments).then((response) => {
+                            try {
+                                response.clone().text().then((text) => {
+                                    try { take(original(text)); } catch (e) {}
+                                }).catch(() => {});
+                            } catch (e) {}
+                            return response;
+                        });
+                    };
+                }
+                const originalSend = XMLHttpRequest.prototype.send;
+                XMLHttpRequest.prototype.send = function () {
+                    this.addEventListener('load', function () {
+                        try { take(original(this.responseText)); } catch (e) {}
+                    });
+                    return originalSend.apply(this, arguments);
+                };
+                for (let i = 0; i < 200; i++) {
+                    if (captured) return captured;
+                    try {
+                        const node = document.querySelector('script#initial-data');
+                        if (node && node.textContent) {
+                            const queries = original(node.textContent).queries;
+                            if (queries) {
+                                for (const k in queries) { if (take(queries[k])) break; }
+                            }
+                        }
+                    } catch (e) {}
+                    await sleep(150);
+                }
+                return JSON.stringify({ error: 'no page data captured' });
             })()
         """
 
