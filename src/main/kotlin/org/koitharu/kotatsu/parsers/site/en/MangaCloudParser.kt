@@ -91,21 +91,29 @@ internal class MangaCloud(context: MangaLoaderContext) :
 	}
 
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-		if (!filter.query.isNullOrEmpty()) {
-			return getSearchManga(filter.query)
+		val query = filter.query?.trim()
+		if (!query.isNullOrEmpty()) {
+			if (query.length < 3) {
+				throw IllegalArgumentException("Search query must be at least 3 characters")
+			}
+			return getBrowseManga(page, filter, order, title = query)
 		}
+
+		val hasFilters = filter.tags.isNotEmpty() ||
+			filter.tagsExclude.isNotEmpty() ||
+			filter.states.isNotEmpty() ||
+			filter.types.isNotEmpty()
+		if (hasFilters) {
+			return getBrowseManga(page, filter, order)
+		}
+
 		return when (order) {
-			SortOrder.POPULARITY -> getPopularManga(page)
+			// Popular has dedicated daily/weekly/monthly lists for the first 3 pages,
+			// then continues through the browse endpoint.
+			SortOrder.POPULARITY -> if (page <= 3) getPopularManga(page) else getBrowseManga(page - 3, filter, order)
 			SortOrder.UPDATED -> getLatestManga(page)
 			else -> getBrowseManga(page, filter, order)
 		}
-	}
-
-	private suspend fun getSearchManga(query: String): List<Manga> {
-		val jsonBody = JSONObject().apply { put("terms", query) }
-		val response = webClient.httpPost("$apiUrl/search".toHttpUrl(), jsonBody).parseJson()
-		val data = response.getJSONArray("data")
-		return (0 until data.length()).map { parseMangaFromSearch(data.getJSONObject(it)) }
 	}
 
 	private suspend fun getPopularManga(page: Int): List<Manga> {
@@ -128,13 +136,19 @@ internal class MangaCloud(context: MangaLoaderContext) :
 		return (0 until list.length()).map { parseMangaFromBrowse(list.getJSONObject(it)) }
 	}
 
-	private suspend fun getBrowseManga(page: Int, filter: MangaListFilter, order: SortOrder? = null): List<Manga> {
+	private suspend fun getBrowseManga(
+		page: Int,
+		filter: MangaListFilter,
+		order: SortOrder? = null,
+		title: String? = null,
+	): List<Manga> {
 		val includes = JSONArray()
 		filter.tags.forEach { includes.put(it.key) }
 		val excludes = JSONArray()
 		filter.tagsExclude.forEach { excludes.put(it.key) }
 
 		val jsonBody = JSONObject().apply {
+			title?.let { put("title", it) }
 			filter.types.firstOrNull()?.let { type ->
 				when (type) {
 					ContentType.MANGA -> put("type", "Manga")
@@ -193,31 +207,6 @@ internal class MangaCloud(context: MangaLoaderContext) :
 			rating = RATING_UNKNOWN,
 			contentRating = ContentRating.SAFE,
 			tags = tags,
-			state = null,
-			authors = emptySet(),
-			source = source,
-		)
-	}
-
-	private fun parseMangaFromSearch(json: JSONObject): Manga {
-		val id = json.getString("id")
-		val title = json.getString("title")
-		val cover = json.optJSONObject("cover")
-
-		val coverUrl = cover?.let {
-			"$cdnUrl/$id/${it.getString("id")}.${it.optString("f", "jpg")}"
-		}
-
-		return Manga(
-			id = generateUid(id),
-			url = id,
-			publicUrl = "https://mangacloud.org/comic/$id",
-			coverUrl = coverUrl,
-			title = title,
-			altTitles = emptySet(),
-			rating = RATING_UNKNOWN,
-			contentRating = ContentRating.SAFE,
-			tags = emptySet(),
 			state = null,
 			authors = emptySet(),
 			source = source,
