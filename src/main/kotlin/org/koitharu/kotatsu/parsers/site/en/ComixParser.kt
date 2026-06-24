@@ -522,15 +522,23 @@ internal class Comix(context: MangaLoaderContext) :
     private suspend fun getChapters(manga: Manga): List<MangaChapter> {
         val hashId = manga.url.substringAfter("/title/")
         val allChapters = loadAllChapters(hashId)
-        val chaptersBuilder = ChaptersListBuilder(allChapters.length())
-        for (i in 0 until allChapters.length()) {
-            val chapterData = allChapters.getJSONObject(i)
+        val parsed = (0 until allChapters.length()).map { allChapters.getJSONObject(it) }
+
+        // Comix mixes many scanlation teams into one list, which is messy to read
+        // and full of duplicates. Pick the single most consistent team (best
+        // coverage of the whole range, present at both the newest and oldest
+        // chapters) and keep only its chapters, deduplicated per number.
+        val chosenTeam = selectConsistentTeamKey(parsed)
+        val chapters = parsed
+            .filter { chosenTeam == null || teamKeyOf(it) == chosenTeam }
+            .let(::dedupByNumber)
+
+        val chaptersBuilder = ChaptersListBuilder(chapters.size)
+        for (chapterData in chapters) {
             val chapterId = chapterData.getLong("id")
             val number = chapterData.getDouble("number").toFloat()
             val name = chapterData.optString("name", "").nullIfEmpty()
-            val scanlationGroup = chapterData.optJSONObject("group") ?: chapterData.optJSONObject("scanlation_group")
-            val scanlator = scanlationGroup?.optString("name", null)
-                ?: if (chapterData.optBoolean("isOfficial")) "Official" else "Unknown"
+            val scanlator = teamNameOf(chapterData)
             val title = if (name != null) {
                 "Chapter $number: $name"
             } else {
@@ -557,6 +565,75 @@ internal class Comix(context: MangaLoaderContext) :
         }
 
         return chaptersBuilder.toList().reversed()
+    }
+
+    private fun teamKeyOf(chapter: JSONObject): String {
+        val group = chapter.optJSONObject("group") ?: chapter.optJSONObject("scanlation_group")
+        group?.optIntOrNull("id")?.let { return "g$it" }
+        group?.optString("name")?.nullIfEmpty()?.let { return "n:${it.lowercase(Locale.US)}" }
+        return if (chapter.optBoolean("isOfficial")) "official" else "unknown"
+    }
+
+    private fun teamNameOf(chapter: JSONObject): String {
+        val group = chapter.optJSONObject("group") ?: chapter.optJSONObject("scanlation_group")
+        return group?.optString("name")?.nullIfEmpty()
+            ?: if (chapter.optBoolean("isOfficial")) "Official" else "Unknown"
+    }
+
+    /**
+     * Picks the most consistent scanlation team to read a series with: the one
+     * covering the most distinct chapter numbers, tie-broken by reaching the
+     * latest chapter, then the earliest, then total votes. This favours a team
+     * that scanlated the whole run end-to-end over one that did a few chapters.
+     */
+    private fun selectConsistentTeamKey(chapters: List<JSONObject>): String? {
+        if (chapters.isEmpty()) return null
+        val globalMax = chapters.maxOf { it.optDouble("number", 0.0) }
+
+        class Stat {
+            val numbers = HashSet<Double>()
+            var min = Double.MAX_VALUE
+            var max = -Double.MAX_VALUE
+            var votes = 0L
+        }
+
+        val stats = LinkedHashMap<String, Stat>()
+        for (chapter in chapters) {
+            val number = chapter.optDouble("number", 0.0)
+            val stat = stats.getOrPut(teamKeyOf(chapter)) { Stat() }
+            stat.numbers.add(number)
+            stat.min = minOf(stat.min, number)
+            stat.max = maxOf(stat.max, number)
+            stat.votes += chapter.optLong("votes", 0L)
+        }
+
+        return stats.entries.maxWithOrNull(
+            compareBy<Map.Entry<String, Stat>>(
+                { it.value.numbers.size },
+                { if (it.value.max >= globalMax) 1 else 0 },
+                { -it.value.min },
+                { it.value.votes },
+            ),
+        )?.key
+    }
+
+    /** Keep one chapter per number, preferring the most-voted (then newest id). */
+    private fun dedupByNumber(chapters: List<JSONObject>): List<JSONObject> {
+        val byNumber = LinkedHashMap<Double, JSONObject>()
+        for (chapter in chapters) {
+            val number = chapter.optDouble("number", 0.0)
+            val current = byNumber[number]
+            if (current == null) {
+                byNumber[number] = chapter
+            } else {
+                val newVotes = chapter.optLong("votes", 0L)
+                val curVotes = current.optLong("votes", 0L)
+                val better = newVotes > curVotes ||
+                    (newVotes == curVotes && chapter.optLong("id", 0L) > current.optLong("id", 0L))
+                if (better) byNumber[number] = chapter
+            }
+        }
+        return byNumber.values.toList()
     }
 
     private suspend fun loadAllChapters(hashId: String): JSONArray {
@@ -935,7 +1012,7 @@ internal class Comix(context: MangaLoaderContext) :
                         );
                         const hasNext = meta.hasNext === true || meta.hasNext === 1 || meta.hasNext === '1' ||
                             (lastPage && page < lastPage);
-                        if (hasNext && seenPages.size < 60) clickNext(); else done = true;
+                        if (hasNext && seenPages.size < 250) clickNext(); else done = true;
                     } catch (e) {}
                 };
 
