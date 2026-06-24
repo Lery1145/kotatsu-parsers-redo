@@ -2,8 +2,10 @@ package org.koitharu.kotatsu.parsers.site.en
 
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.json.JSONArray
 import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
@@ -237,10 +239,22 @@ internal class Comix(context: MangaLoaderContext) :
             } else {
                 "$baseUrl/${rawUrl.trimStart('/')}"
             }
-            // `s == 1` marks a tile-scrambled image. The interceptor descrambles
-            // based on the response header, but tagging the URL keeps scrambled
-            // pages from colliding with any unscrambled namesake in the cache.
-            val finalUrl = if (item?.optInt("s", 0) == 1) "$imageUrl#$SCRAMBLED_FRAGMENT" else imageUrl
+            // `s == 1` marks a "v3" tile-scrambled image. The server only returns
+            // the x-scramble-*/x-enc-* headers when the request carries the `v3`
+            // query flag, so we add it here; the interceptor then descrambles based
+            // on those headers. The `#scrambled` fragment (dropped before the request
+            // is sent) keeps scrambled pages from colliding with any unscrambled
+            // namesake in the cache.
+            val finalUrl = if (item?.optInt("s", 0) == 1) {
+                val withV3 = if (imageUrl.toHttpUrl().queryParameterNames.contains("v3")) {
+                    imageUrl
+                } else {
+                    imageUrl.toHttpUrl().newBuilder().addQueryParameter("v3", null).build().toString()
+                }
+                "$withV3#$SCRAMBLED_FRAGMENT"
+            } else {
+                imageUrl
+            }
             MangaPage(
                 id = generateUid("$chapterId-$i"),
                 url = finalUrl,
@@ -255,27 +269,130 @@ internal class Comix(context: MangaLoaderContext) :
         if (!response.isSuccessful) {
             return response
         }
-        // The image CDN signals a tile-scrambled image with this header; it's
-        // the authoritative trigger (only scrambled images carry it, so API and
-        // HTML responses pass straight through). A zero seed means "not scrambled".
-        val seed = response.header("x-scramble-seed")?.toLongOrNull()?.toInt()
-        if (seed == null || seed == 0) {
+
+        // The CDN protects images with two independent, stackable layers, each
+        // signalled by its own response headers (only protected images carry
+        // them, so API and HTML responses pass straight through):
+        //   * a byte-level XOR stream cipher        — x-enc-seed / x-enc-len / x-enc-algo
+        //   * a 5x5 tile shuffle on the decoded image — x-scramble-seed / x-scramble-grid /
+        //                                               x-scramble-algo / x-scramble-hash
+        val rawScrambleGrid = response.header("x-scramble-grid")
+        val rawScrambleAlgo = response.header("x-scramble-algo")
+        val rawScrambleHash = response.header("x-scramble-hash")
+        val rawEncAlgo = response.header("x-enc-algo")
+
+        val encSeed = response.header("x-enc-seed")?.toLongOrNull()?.toInt()
+        val encLen = response.header("x-enc-len")?.toIntOrNull()
+        val scrambleSeed = response.header("x-scramble-seed")?.toLongOrNull()?.toInt()
+        val scrambleHash = decodeScrambleHash(rawScrambleHash)
+
+        val needsXor = encSeed != null && encSeed != 0 && encLen != null
+        val shouldDescrambleGrid = rawScrambleGrid == "5x5" &&
+            (rawScrambleAlgo == null || rawScrambleAlgo == "1" || rawScrambleAlgo == "2" || rawScrambleAlgo == "3") &&
+            scrambleSeed != null && scrambleSeed != 0
+
+        if (!needsXor && !shouldDescrambleGrid) {
             return response
         }
-        return context.redrawImageResponse(response) { bitmap ->
-            descramble(bitmap, seed)
+
+        val contentType = response.body?.contentType()
+        val originalBytes = response.body?.bytes() ?: return response
+        val bytes = if (needsXor) {
+            decodeEncodedBytes(originalBytes, encSeed!!, encLen!!, rawEncAlgo)
+        } else {
+            originalBytes
+        }
+
+        // Re-wrap the (de-XORed) bytes so the redraw helper can decode them into
+        // a bitmap, then undo the tile shuffle on top.
+        val decodedResponse = response.newBuilder()
+            .body(bytes.toResponseBody(contentType))
+            .build()
+
+        if (!shouldDescrambleGrid) {
+            return decodedResponse
+        }
+
+        return context.redrawImageResponse(decodedResponse) { bitmap ->
+            descramble(bitmap, scrambleSeed!! xor scrambleHash, rawScrambleAlgo)
         }
     }
 
+    // A handful of older images ship a constant hash that gets folded into the
+    // scramble seed; everything else (and the modern format) uses the seed as-is.
+    private fun decodeScrambleHash(hash: String?): Int = when (hash?.trim()) {
+        "03632" -> 58414
+        else -> 0
+    }
+
+    // Undo the x-enc XOR stream. Algo "2" is ambiguous about which generator the
+    // server used, so we try each candidate and keep the first that decodes to a
+    // recognisable image; every other algo is the plain LCG keystream.
+    private fun decodeEncodedBytes(bytes: ByteArray, seed: Int, length: Int, algo: String?): ByteArray {
+        if (algo != "2") {
+            return decodeWithLcg(bytes, seed, length)
+        }
+        val candidates = listOf(
+            decodeWithXorshift(bytes, seed or 1, length, false),
+            decodeWithXorshift(bytes, seed, length, false),
+            decodeWithXorshift(bytes, seed or 1, length, true),
+            decodeWithLcg(bytes, seed, length),
+        )
+        return candidates.firstOrNull { it.hasImageSignature() } ?: candidates.first()
+    }
+
+    private fun decodeWithLcg(bytes: ByteArray, seed: Int, length: Int): ByteArray {
+        val result = bytes.copyOf()
+        var state = seed
+        val limit = minOf(result.size, length)
+        for (i in 0 until limit) {
+            state = state * ENC_MULTIPLIER + ENC_INCREMENT
+            result[i] = (result[i].toInt() xor (state ushr 24)).toByte()
+        }
+        return result
+    }
+
+    private fun decodeWithXorshift(bytes: ByteArray, initialState: Int, length: Int, highByte: Boolean): ByteArray {
+        val result = bytes.copyOf()
+        var state = initialState
+        val limit = minOf(result.size, length)
+        for (i in 0 until limit) {
+            state = state xor (state shl 13)
+            state = state xor (state ushr 17)
+            state = state xor (state shl 5)
+            val key = if (highByte) state ushr 24 else state and 0xFF
+            result[i] = (result[i].toInt() xor key).toByte()
+        }
+        return result
+    }
+
+    private fun ByteArray.hasImageSignature(): Boolean = size >= 12 && (
+        (
+            this[0] == 'R'.code.toByte() && this[1] == 'I'.code.toByte() && this[2] == 'F'.code.toByte() &&
+                this[3] == 'F'.code.toByte() && this[8] == 'W'.code.toByte() && this[9] == 'E'.code.toByte() &&
+                this[10] == 'B'.code.toByte() && this[11] == 'P'.code.toByte()
+            ) ||
+            (this[0] == 0xFF.toByte() && this[1] == 0xD8.toByte()) ||
+            (
+                this[0] == 0x89.toByte() && this[1] == 'P'.code.toByte() && this[2] == 'N'.code.toByte() &&
+                    this[3] == 'G'.code.toByte()
+                )
+        )
+
     // Reverses the site's 5x5 tile shuffle. The scramble order is a Fisher-Yates
-    // permutation driven by an LCG seeded with the `x-scramble-seed` header, so
-    // tile `i` of the scrambled image belongs at position `order[i]`.
-    private fun descramble(source: Bitmap, seed: Int): Bitmap {
+    // permutation driven by a PRNG seeded with `x-scramble-seed` (xored with the
+    // optional hash). Algo "3" uses a xorshift generator; every other algo uses an
+    // LCG. `order[srcIdx]` gives the destination position of scrambled tile srcIdx.
+    private fun descramble(source: Bitmap, seed: Int, algo: String?): Bitmap {
         val width = source.width
         val height = source.height
         val tileW = width / GRID_COLS
         val tileH = height / GRID_ROWS
-        val order = buildScrambleOrder(seed, NUM_TILES)
+        val order = if (algo == "3") {
+            buildScrambleOrderXorshift(seed, NUM_TILES)
+        } else {
+            buildScrambleOrderLcg(seed, NUM_TILES)
+        }
 
         val output = context.createBitmap(width, height)
         // Copy the whole image first so any edge pixels left over from the
@@ -295,11 +412,26 @@ internal class Comix(context: MangaLoaderContext) :
         return output
     }
 
-    private fun buildScrambleOrder(seed: Int, n: Int): IntArray {
+    private fun buildScrambleOrderLcg(seed: Int, n: Int): IntArray {
         val arr = IntArray(n) { it }
         var state = seed
         for (i in n - 1 downTo 1) {
             state = state * LCG_MULTIPLIER + LCG_INCREMENT
+            val j = ((state.toLong() and 0xFFFFFFFFL) % (i + 1)).toInt()
+            val tmp = arr[i]
+            arr[i] = arr[j]
+            arr[j] = tmp
+        }
+        return arr
+    }
+
+    private fun buildScrambleOrderXorshift(seed: Int, n: Int): IntArray {
+        val arr = IntArray(n) { it }
+        var state = seed or 1
+        for (i in n - 1 downTo 1) {
+            state = state xor (state shl 13)
+            state = state xor (state ushr 17)
+            state = state xor (state shl 5)
             val j = ((state.toLong() and 0xFFFFFFFFL) % (i + 1)).toInt()
             val tmp = arr[i]
             arr[i] = arr[j]
@@ -761,6 +893,8 @@ internal class Comix(context: MangaLoaderContext) :
         private const val NUM_TILES = GRID_COLS * GRID_ROWS
         private const val LCG_MULTIPLIER = 1664525
         private const val LCG_INCREMENT = 1013904223
+        private const val ENC_MULTIPLIER = 1000005
+        private const val ENC_INCREMENT = 1234567891
         private val RELATIVE_DATE_REGEX = Regex("""^(\d+)\s*(s|m|h|d|w|mo|mos|y|yr|yrs|min|mins|sec|secs|hr|hrs|day|days|week|weeks|month|months|year|years)$""")
         private const val WEBVIEW_API_TIMEOUT = 90000L
         private const val CLOUDFLARE_BLOCKED = "CLOUDFLARE_BLOCKED"
