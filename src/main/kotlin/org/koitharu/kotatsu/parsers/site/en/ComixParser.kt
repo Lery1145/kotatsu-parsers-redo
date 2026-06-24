@@ -8,6 +8,7 @@ import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.json.JSONArray
 import org.json.JSONObject
+import org.jsoup.nodes.Document
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.bitmap.Bitmap
@@ -101,12 +102,15 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
-        // The `/api/v1/manga` listing/search endpoint is request-signed: an
-        // unsigned plain GET now returns 403 "missing token". Build a relative
-        // API path and let the WebView bridge (`fetchProtected`) sign it, the
-        // same way chapters and pages are fetched.
-        val apiPath = buildString {
-            append("/api/v1/manga?")
+        // The `/api/v1/manga` endpoint is request-signed (an unsigned GET 403s
+        // with "missing token"), so instead of calling it we do what the website
+        // does: load the `/browse` page and read the results the server embeds in
+        // its `script#initial-data` JSON. No token needed.
+        val query = filter.query
+        val browseUrl = buildString {
+            append("https://")
+            append(domain)
+            append("/browse?")
             var firstParam = true
             fun addParam(param: String) {
                 if (firstParam) {
@@ -117,19 +121,19 @@ internal class Comix(context: MangaLoaderContext) :
                 }
             }
 
-            // Search keyword if provided
-            if (!filter.query.isNullOrEmpty()) {
-                addParam("keyword=${filter.query.urlEncoded()}")
-            }
-
-            // Use the provided sort order directly
-            when (order) {
-                SortOrder.RELEVANCE -> addParam("order[relevance]=desc")
-                SortOrder.UPDATED -> addParam("order[chapter_updated_at]=desc")
-                SortOrder.POPULARITY -> addParam("order[views_30d]=desc")
-                SortOrder.NEWEST -> addParam("order[created_at]=desc")
-                SortOrder.ALPHABETICAL -> addParam("order[title]=asc")
-                else -> addParam("order[chapter_updated_at]=desc")
+            if (!query.isNullOrEmpty()) {
+                // The website routes keyword search through `q` + `sort`.
+                addParam("q=${query.urlEncoded()}")
+                addParam("sort=relevance:desc")
+            } else {
+                when (order) {
+                    SortOrder.RELEVANCE -> addParam("order[relevance]=desc")
+                    SortOrder.UPDATED -> addParam("order[chapter_updated_at]=desc")
+                    SortOrder.POPULARITY -> addParam("order[views_30d]=desc")
+                    SortOrder.NEWEST -> addParam("order[created_at]=desc")
+                    SortOrder.ALPHABETICAL -> addParam("order[title]=asc")
+                    else -> addParam("order[chapter_updated_at]=desc")
+                }
             }
 
             // Handle genre/tag filtering. A tag key is normally the numeric id
@@ -151,18 +155,47 @@ internal class Comix(context: MangaLoaderContext) :
                     addParam("genres_ex[]=$excludeId")
                 }
             }
-            addParam("limit=$pageSize")
             addParam("page=$page")
         }
 
-        val response = webViewApiJson(apiPath)
-        val result = response.getJSONObject("result")
-        val items = result.getJSONArray("items")
-
+        val items = loadBrowseItems(browseUrl)
         return (0 until items.length()).map { i ->
-            val item = items.getJSONObject(i)
-            parseMangaFromJson(item)
+            parseMangaFromJson(items.getJSONObject(i))
         }
+    }
+
+    /**
+     * Returns the manga items the `/browse` page exposes. Fast path reads the
+     * server-rendered `script#initial-data` from a plain GET; if that's absent
+     * (Cloudflare interstitial, or a route that didn't pre-render), a WebView
+     * loads the page so it fetches and decrypts the API for itself, and we
+     * capture the payload it parses.
+     */
+    private suspend fun loadBrowseItems(browseUrl: String): JSONArray {
+        runCatching { webClient.httpGet(browseUrl).parseHtml() }
+            .getOrNull()
+            ?.let { extractInitialDataItems(it) }
+            ?.let { return it }
+
+        val response = evaluateWebViewApiJson(
+            pageUrl = browseUrl,
+            script = BROWSE_CAPTURE_SCRIPT,
+        )
+        return response.optJSONObject("result")?.optJSONArray("items")
+            ?: response.optJSONArray("items")
+            ?: JSONArray()
+    }
+
+    private fun extractInitialDataItems(document: Document): JSONArray? {
+        val raw = document.selectFirst("script#initial-data")?.data()?.nullIfEmpty() ?: return null
+        val queries = runCatching { JSONObject(raw).optJSONObject("queries") }.getOrNull() ?: return null
+        for (key in queries.keys()) {
+            val value = queries.optJSONObject(key) ?: continue
+            val items = value.optJSONObject("result")?.optJSONArray("items")
+                ?: value.optJSONArray("items")
+            if (items != null && items.length() > 0) return items
+        }
+        return null
     }
 
     private fun parseMangaFromJson(json: JSONObject): Manga {
@@ -204,22 +237,37 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     override suspend fun getDetails(manga: Manga): Manga = coroutineScope {
-        val hashId = manga.url.substringAfter("/title/")
         val chaptersDeferred = async { getChapters(manga) }
 
-        // Enrich from the single-title endpoint when possible. It's the same
-        // signed `/api/v1/manga/...` family as the listing, so an unsigned GET
-        // may 403; if it does, fall back to the listing-derived manga (which
+        // Enrich from the title page's `script#initial-data` (the same SSR JSON
+        // the website hydrates from), so no signed API call is needed. If the
+        // page is gated/empty, fall back to the listing-derived manga (which
         // already carries synopsis/tags/authors) so details still open.
-        val updatedManga = runCatching { getApiJson(apiUrl("manga/$hashId")) }
+        val updatedManga = runCatching { webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml() }
             .getOrNull()
-            ?.takeIf { it.has("result") }
-            ?.let { parseMangaFromJson(it.getJSONObject("result")) }
+            ?.let { extractInitialDataDetail(it) }
+            ?.let { parseMangaFromJson(it) }
             ?: manga
 
         return@coroutineScope updatedManga.copy(
             chapters = chaptersDeferred.await(),
         )
+    }
+
+    private fun extractInitialDataDetail(document: Document): JSONObject? {
+        val raw = document.selectFirst("script#initial-data")?.data()?.nullIfEmpty() ?: return null
+        val queries = runCatching { JSONObject(raw).optJSONObject("queries") }.getOrNull() ?: return null
+        // The detail query key embeds "detail"; its value is the manga object
+        // (occasionally wrapped in `result`).
+        for (key in queries.keys()) {
+            if (!key.contains("detail")) continue
+            val value = queries.optJSONObject(key) ?: continue
+            val candidate = value.optJSONObject("result") ?: value
+            if (candidate.has("hid") || candidate.has("hash_id") || candidate.has("title")) {
+                return candidate
+            }
+        }
+        return null
     }
 
     override suspend fun getRelatedManga(seed: Manga): List<Manga> = emptyList()
@@ -521,19 +569,6 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     private fun apiUrl(path: String): String = "https://$domain/api/v1/${path.removePrefix("/")}"
-
-    /**
-     * Plain GET against the JSON API (popular/latest/search/details). Matches the
-     * upstream Keiyoushi behaviour — these endpoints aren't request-signed. If the
-     * response isn't JSON it's almost certainly a Cloudflare interstitial, so we
-     * hand off to the in-app browser to clear it.
-     */
-    private suspend fun getApiJson(url: String): JSONObject {
-        val response = webClient.httpGet(url)
-        return runCatching { response.parseJson() }.getOrElse { e ->
-            requestCloudflareVerification(url, e)
-        }
-    }
 
     private suspend fun webViewApiJson(apiPath: String): JSONObject {
         return evaluateWebViewApiJson(
@@ -905,5 +940,52 @@ internal class Comix(context: MangaLoaderContext) :
         private val INTERCEPT_URL_REGEX = Regex("https://kotatsu\\.intercept/.*", RegexOption.IGNORE_CASE)
         private const val CLOUDFLARE_MESSAGE =
             "Cloudflare verification is required. Open Comix in the in-app browser, complete the check, then try again."
+
+        // WebView fallback for the browse page: read the SSR `script#initial-data`
+        // once the page hydrates, and as a backstop capture any decrypted API
+        // payload the app parses (`{ result: { items: [...] } }`). Returns the
+        // payload as a JSON string for the bridge to hand back.
+        private const val BROWSE_CAPTURE_SCRIPT = """
+            (async () => {
+                const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+                const origParse = JSON.parse;
+                let captured = null;
+                const pickFromQueries = (queries) => {
+                    if (!queries) return null;
+                    for (const k in queries) {
+                        const v = queries[k];
+                        const items = (v && v.result && v.result.items) || (v && v.items);
+                        if (Array.isArray(items) && items.length > 0) {
+                            return JSON.stringify(v && v.result ? v : { result: v });
+                        }
+                    }
+                    return null;
+                };
+                JSON.parse = new Proxy(origParse, {
+                    apply(target, thisArg, args) {
+                        const parsed = Reflect.apply(target, thisArg, args);
+                        try {
+                            const items = parsed && parsed.result && parsed.result.items;
+                            if (!captured && Array.isArray(items) && items.length > 0) {
+                                captured = JSON.stringify(parsed);
+                            }
+                        } catch (e) {}
+                        return parsed;
+                    }
+                });
+                for (let i = 0; i < 120; i++) {
+                    if (captured) return captured;
+                    try {
+                        const node = document.querySelector('script#initial-data');
+                        if (node && node.textContent) {
+                            const got = pickFromQueries(origParse(node.textContent).queries);
+                            if (got) return got;
+                        }
+                    } catch (e) {}
+                    await sleep(250);
+                }
+                return JSON.stringify({ error: 'no browse data captured' });
+            })()
+        """
     }
 }
