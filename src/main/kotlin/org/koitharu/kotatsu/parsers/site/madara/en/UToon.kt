@@ -139,12 +139,12 @@ internal class UToon(context: MangaLoaderContext) :
 
 		return (0 until array.length()).mapNotNull { i ->
 			val obj = array.optJSONObject(i) ?: return@mapNotNull null
+			if (obj.optBoolean("locked", false)) return@mapNotNull null // skip premium/locked chapters
 			val chapterUrl = obj.optString("url").nullIfEmpty()?.toRelativeUrl(domain) ?: return@mapNotNull null
 			val label = obj.optString("label").nullIfEmpty() ?: return@mapNotNull null
-			val locked = obj.optBoolean("locked", false)
 			MangaChapter(
 				id = generateUid(chapterUrl),
-				title = if (locked) "🔒 $label" else label,
+				title = label,
 				number = obj.optDouble("num", 0.0).toFloat(),
 				volume = 0,
 				url = chapterUrl,
@@ -153,7 +153,7 @@ internal class UToon(context: MangaLoaderContext) :
 				branch = null,
 				source = source,
 			)
-		}
+		}.reversed() // CH is newest-first; Kotatsu expects oldest-first
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {

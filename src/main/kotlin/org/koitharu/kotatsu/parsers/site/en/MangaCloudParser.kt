@@ -93,77 +93,34 @@ internal class MangaCloud(context: MangaLoaderContext) :
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
 		val query = filter.query?.trim()
 		if (!query.isNullOrEmpty()) {
-			if (query.length < 3) {
-				throw IllegalArgumentException("Search query must be at least 3 characters")
-			}
-			return getBrowseManga(page, filter, order, title = query)
+			// Search is a standalone endpoint: it isn't paginated and can't be combined with filters.
+			if (page > 1) return emptyList()
+			return getSearchManga(query)
 		}
-
-		val hasFilters = filter.tags.isNotEmpty() ||
-			filter.tagsExclude.isNotEmpty() ||
-			filter.states.isNotEmpty() ||
-			filter.types.isNotEmpty()
-		if (hasFilters) {
-			return getBrowseManga(page, filter, order)
-		}
-
-		return when (order) {
-			// Popular has dedicated daily/weekly/monthly lists for the first 3 pages,
-			// then continues through the browse endpoint.
-			SortOrder.POPULARITY -> if (page <= 3) getPopularManga(page) else getBrowseManga(page - 3, filter, order)
-			SortOrder.UPDATED -> getLatestManga(page)
-			else -> getBrowseManga(page, filter, order)
-		}
+		return getLibraryManga(page, filter, order)
 	}
 
-	private suspend fun getPopularManga(page: Int): List<Manga> {
-		val time = when (page) {
-			1 -> "today"
-			2 -> "week"
-			else -> "month"
-		}
-		val response = webClient.httpGet("$apiUrl/comic-popular-view/$time").parseJson()
-		val data = response.getJSONObject("data")
-		val list = data.getJSONArray("list")
-		return (0 until list.length()).map { parseMangaFromBrowse(list.getJSONObject(it)) }
+	private suspend fun getSearchManga(query: String): List<Manga> {
+		val jsonBody = JSONObject().apply { put("terms", query) }
+		val response = webClient.httpPost("$apiUrl/search".toHttpUrl(), jsonBody).parseJson()
+		val data = response.getJSONArray("data")
+		return (0 until data.length()).map { parseMangaFromSearch(data.getJSONObject(it)) }
 	}
 
-	private suspend fun getLatestManga(page: Int): List<Manga> {
-		val jsonBody = JSONObject().apply { put("page", page) }
-		val response = webClient.httpPost("$apiUrl/comic-updates".toHttpUrl(), jsonBody).parseJson()
-		val data = response.getJSONObject("data")
-		val list = data.getJSONArray("list")
-		return (0 until list.length()).map { parseMangaFromBrowse(list.getJSONObject(it)) }
-	}
-
-	private suspend fun getBrowseManga(
-		page: Int,
-		filter: MangaListFilter,
-		order: SortOrder? = null,
-		title: String? = null,
-	): List<Manga> {
+	private suspend fun getLibraryManga(page: Int, filter: MangaListFilter, order: SortOrder): List<Manga> {
 		val includes = JSONArray()
 		filter.tags.forEach { includes.put(it.key) }
 		val excludes = JSONArray()
 		filter.tagsExclude.forEach { excludes.put(it.key) }
 
 		val jsonBody = JSONObject().apply {
-			title?.let { put("title", it) }
+			if (includes.length() > 0) put("includes", includes)
+			if (excludes.length() > 0) put("excludes", excludes)
 			filter.types.firstOrNull()?.let { type ->
 				when (type) {
 					ContentType.MANGA -> put("type", "Manga")
 					ContentType.MANHWA -> put("type", "Manhwa")
 					ContentType.MANHUA -> put("type", "Manhua")
-					else -> {}
-				}
-			}
-			order?.let {
-				when (it) {
-					SortOrder.NEWEST -> put("sort", "created_date-DESC")
-					SortOrder.ALPHABETICAL -> put("sort", "title-ASC")
-					SortOrder.ALPHABETICAL_DESC -> put("sort", "title-DESC")
-					SortOrder.UPDATED -> put("sort", "updated_date-DESC")
-					SortOrder.RATING -> put("sort", "rating")
 					else -> {}
 				}
 			}
@@ -176,37 +133,63 @@ internal class MangaCloud(context: MangaLoaderContext) :
 					else -> {}
 				}
 			}
-			put("includes", includes)
-			put("excludes", excludes)
-			put("page", page)
+			when (order) {
+				SortOrder.NEWEST -> put("sort", "created_date-DESC")
+				SortOrder.ALPHABETICAL -> put("sort", "title-ASC")
+				SortOrder.UPDATED -> put("sort", "updated_date-DESC")
+				else -> {} // POPULARITY / RELEVANCE use the default order
+			}
+			// Page 1 sends no "page" field
+			if (page > 1) put("page", page)
 		}
 
-		val response = webClient.httpPost("$apiUrl/comic/browse".toHttpUrl(), jsonBody).parseJson()
+		val response = webClient.httpPost("$apiUrl/comic/library".toHttpUrl(), jsonBody).parseJson()
 		val data = response.getJSONArray("data")
-		return (0 until data.length()).map { parseMangaFromBrowse(data.getJSONObject(it)) }
+		return (0 until data.length()).map { parseMangaFromLibrary(data.getJSONObject(it)) }
 	}
 
-	private fun parseMangaFromBrowse(json: JSONObject): Manga {
+	private fun coverUrl(id: String, cover: JSONObject?): String? = cover?.let {
+		"$cdnUrl/$id/${it.getString("id")}.${it.optString("f", "jpg")}"
+	}
+
+	private fun parseMangaFromLibrary(json: JSONObject): Manga {
 		val id = json.getString("id")
-		val title = json.getString("title")
-		val cover = json.optJSONObject("cover")
-
-		val coverUrl = cover?.let {
-			"$cdnUrl/$id/${it.getString("id")}.${it.optString("f", "jpg")}"
-		}
-
-		val tags = parseTags(json.optJSONArray("tags"))
+		val ratingScore = json.optDouble("rating_score", -1.0)
 
 		return Manga(
 			id = generateUid(id),
 			url = id,
 			publicUrl = "https://mangacloud.org/comic/$id",
-			coverUrl = coverUrl,
-			title = title,
+			coverUrl = coverUrl(id, json.optJSONObject("cover")),
+			title = json.getString("title"),
 			altTitles = emptySet(),
+			rating = if (ratingScore >= 0) (ratingScore / 10.0).toFloat() else RATING_UNKNOWN,
+			contentRating = ContentRating.SAFE,
+			tags = emptySet(),
+			state = null,
+			authors = emptySet(),
+			description = json.optString("description").nullIfEmpty(),
+			source = source,
+		)
+	}
+
+	private fun parseMangaFromSearch(json: JSONObject): Manga {
+		val id = json.getString("id")
+		val altTitles = json.optString("alt_titles").split("•")
+			.map { it.trim() }
+			.filter { it.isNotBlank() }
+			.toSet()
+
+		return Manga(
+			id = generateUid(id),
+			url = id,
+			publicUrl = "https://mangacloud.org/comic/$id",
+			coverUrl = coverUrl(id, json.optJSONObject("cover")),
+			title = json.getString("title"),
+			altTitles = altTitles,
 			rating = RATING_UNKNOWN,
 			contentRating = ContentRating.SAFE,
-			tags = tags,
+			tags = emptySet(),
 			state = null,
 			authors = emptySet(),
 			source = source,
