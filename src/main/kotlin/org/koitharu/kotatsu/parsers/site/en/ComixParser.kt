@@ -549,12 +549,11 @@ internal class Comix(context: MangaLoaderContext) :
 
     private suspend fun loadAllChapters(hashId: String): JSONArray {
         val apiPath = "/api/v1/manga/$hashId/chapters"
-        // Run the signer-driven pagination on the stable home page rather than
-        // the title page: the title page errors on a "protected fetch 404" and
-        // reloads, which de-injects our script before it can finish. The signer
-        // glue is global, so the home page works (as getPages already relies on).
+        // Run the signer-driven pagination on the stable `/browse` route — the
+        // home/title pages error on a "protected fetch 404" and reload-loop,
+        // de-injecting our script before it can finish (see [signerHostUrl]).
         val response = evaluateWebViewApiJson(
-            pageUrl = "https://$domain/?kotatsu_comix_bridge=${System.currentTimeMillis()}",
+            pageUrl = signerHostUrl(),
             script = buildWebViewApiScript(
                 """
                     const basePath = ${apiPath.toJsString()};
@@ -577,11 +576,17 @@ internal class Comix(context: MangaLoaderContext) :
                     if (lastPage > 1) {
                         const requests = [];
                         for (let page = 2; page <= lastPage; page++) {
-                            requests.push(fetchProtected(basePath + "?limit=" + limit + "&page=" + page));
+                            // Tolerate a failed page: return its items or [] so one
+                            // bad request never rejects the whole batch.
+                            requests.push(
+                                fetchProtected(basePath + "?limit=" + limit + "&page=" + page)
+                                    .then((payload) => itemsOf(unwrap(payload)))
+                                    .catch(() => [])
+                            );
                         }
-                        const payloads = await Promise.all(requests);
-                        for (const payload of payloads) {
-                            for (const item of itemsOf(unwrap(payload))) items.push(item);
+                        const lists = await Promise.all(requests);
+                        for (const list of lists) {
+                            for (const item of list) items.push(item);
                         }
                     }
                     return JSON.stringify({ items: items });
@@ -593,9 +598,16 @@ internal class Comix(context: MangaLoaderContext) :
 
     private fun apiUrl(path: String): String = "https://$domain/api/v1/${path.removePrefix("/")}"
 
+    // The signer glue is global, so we host it on the `/browse` route. The home
+    // page (and the cache-buster URL we used before) isn't a real SPA route — its
+    // `secure-*.js` throws "protected fetch 404" and the app reload-loops, which
+    // de-injects our script before it can run. `/browse` loads cleanly and stays
+    // put, so the signer-driven fetches actually complete.
+    private fun signerHostUrl(): String = "https://$domain/browse?kotatsu=${System.currentTimeMillis()}"
+
     private suspend fun webViewApiJson(apiPath: String): JSONObject {
         return evaluateWebViewApiJson(
-            pageUrl = "https://$domain/?kotatsu_comix_bridge=${System.currentTimeMillis()}",
+            pageUrl = signerHostUrl(),
             script = buildWebViewApiScript("return JSON.stringify(await fetchProtected(${apiPath.toJsString()}));"),
         )
     }
