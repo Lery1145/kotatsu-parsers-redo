@@ -514,7 +514,7 @@ internal class Comix(context: MangaLoaderContext) :
 
     private suspend fun getChapters(manga: Manga): List<MangaChapter> {
         val hashId = manga.url.substringAfter("/title/")
-        val allChapters = loadAllChapters(hashId, manga.url.toAbsoluteUrl(domain))
+        val allChapters = loadAllChapters(hashId)
         val chaptersBuilder = ChaptersListBuilder(allChapters.length())
         for (i in 0 until allChapters.length()) {
             val chapterData = allChapters.getJSONObject(i)
@@ -547,10 +547,14 @@ internal class Comix(context: MangaLoaderContext) :
         return chaptersBuilder.toList().reversed()
     }
 
-    private suspend fun loadAllChapters(hashId: String, pageUrl: String): JSONArray {
+    private suspend fun loadAllChapters(hashId: String): JSONArray {
         val apiPath = "/api/v1/manga/$hashId/chapters"
+        // Run the signer-driven pagination on the stable home page rather than
+        // the title page: the title page errors on a "protected fetch 404" and
+        // reloads, which de-injects our script before it can finish. The signer
+        // glue is global, so the home page works (as getPages already relies on).
         val response = evaluateWebViewApiJson(
-            pageUrl = pageUrl,
+            pageUrl = "https://$domain/?kotatsu_comix_bridge=${System.currentTimeMillis()}",
             script = buildWebViewApiScript(
                 """
                     const basePath = ${apiPath.toJsString()};
