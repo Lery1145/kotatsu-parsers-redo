@@ -10,12 +10,13 @@ import org.koitharu.kotatsu.parsers.util.*
 import java.text.SimpleDateFormat
 import java.util.*
 
-@MangaSourceParser("DOUJINDESU", "DoujinDesu.tv", "id")
+@MangaSourceParser("DOUJINDESU", "doujin.desu.xxx"
+                   , "id")
 internal class DoujinDesuParser(context: MangaLoaderContext) :
 	PagedMangaParser(context, MangaParserSource.DOUJINDESU, pageSize = 18) {
 
 	override val configKeyDomain: ConfigKey.Domain
-		get() = ConfigKey.Domain("doujindesu.tv")
+		get() = ConfigKey.Domain("doujin.desu.xxx")
 
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
